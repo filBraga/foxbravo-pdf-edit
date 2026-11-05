@@ -45,7 +45,7 @@ echo Installing what the app needs. The first time takes a minute or two...
 echo.
 echo Building the .exe...
 ".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed ^
-    --name "FoxbravoPDFEdit" "foxbravo_pdf_edit.py" || goto :fail
+    --icon "logo.png" --add-data "logo.png;." --name "FoxbravoPDFEdit" "foxbravo_pdf_edit.py" || goto :fail
 
 copy /y "dist\FoxbravoPDFEdit.exe" "%~dp0" >nul || goto :fail
 

@@ -2232,10 +2232,18 @@ def main():
     if sys.platform == "win32":
         try:
             import ctypes
+            # Own taskbar identity, otherwise a source run groups under python.exe's icon.
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Foxbravo.PDFEdit")
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
     root = tk.Tk()
+    try:
+        # __file__ sits in the bundle folder when frozen, next to logo.png either way.
+        logo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+        root.iconphoto(True, tk.PhotoImage(master=root, file=logo))
+    except tk.TclError:
+        pass  # a missing icon must not stop the app from opening
     try:
         ttk.Style(root).theme_use("vista" if sys.platform == "win32" else "clam")
     except tk.TclError:
