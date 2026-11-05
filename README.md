@@ -4,6 +4,7 @@ A small, free desktop PDF editor for Windows, written in Python with Tkinter and
 
 ## Features
 
+- **View mode by default**: PDFs open read-only. Click **Edit** (Ctrl+E) to show the editing tools, and **Done** to go back
 - **Edit existing text**: hover over a line, click it, and type. Only the part you changed is rewritten.
 - **Find & replace** across the whole document (Ctrl+H)
 - **Highlight**, **freehand drawing**, **text boxes** and **sticky notes**
