@@ -7,7 +7,7 @@ Features
   * Highlight, freehand drawing, text boxes, sticky notes
   * Signatures (draw or load an image, optionally remembered)
   * Fill in PDF forms
-  * Merge / insert other PDFs, extract pages, split into single pages
+  * Merge PDFs in any order (into the open PDF or a new one), extract pages, split into single pages
   * Rotate, move and delete pages
   * Undo / redo
 
@@ -26,7 +26,7 @@ import tempfile
 from dataclasses import dataclass
 
 import pymupdf
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
@@ -132,6 +132,90 @@ def run_at(runs: list, point: pymupdf.Point):
             if best is None or d < best_d:
                 best, best_d = run, d
     return best
+
+
+class PageText:
+    """Every character on a page in reading order, for selecting and copying text in view mode."""
+
+    def __init__(self, page: pymupdf.Page):
+        self.chars = []  # (character, rect, line number)
+        self.lines = []  # (line rect, first char index, end char index)
+        raw = page.get_text("rawdict", flags=TEXT_FLAGS)
+        for block in raw["blocks"]:
+            if block.get("type", 0) != 0:
+                continue
+            for line in block["lines"]:
+                start = len(self.chars)
+                for span in line["spans"]:
+                    for ch in span["chars"]:
+                        self.chars.append((ch["c"], pymupdf.Rect(ch["bbox"]), len(self.lines)))
+                if len(self.chars) > start:
+                    self.lines.append((pymupdf.Rect(line["bbox"]), start, len(self.chars)))
+
+    def line_at(self, pt, slack=2.0):
+        """Index of the line under a point, or None."""
+        for i, (r, _s, _e) in enumerate(self.lines):
+            if r.x0 - slack <= pt.x <= r.x1 + slack and r.y0 <= pt.y <= r.y1:
+                return i
+        return None
+
+    def caret(self, pt) -> int | None:
+        """Position between characters nearest to a point (0..len(chars))."""
+        if not self.lines:
+            return None
+        li = self.line_at(pt)
+        if li is None:
+            def dist(r):
+                dx = max(r.x0 - pt.x, 0, pt.x - r.x1)
+                dy = max(r.y0 - pt.y, 0, pt.y - r.y1)
+                return dx * dx + dy * dy
+            li = min(range(len(self.lines)), key=lambda i: dist(self.lines[i][0]))
+        _r, start, end = self.lines[li]
+        for i in range(start, end):
+            rect = self.chars[i][1]
+            if pt.x < (rect.x0 + rect.x1) / 2:
+                return i
+        return end
+
+    def word(self, pt):
+        """(start, end) of the word under a point, or None."""
+        li = self.line_at(pt)
+        if li is None:
+            return None
+        _r, start, end = self.lines[li]
+        i = next((k for k in range(start, end) if self.chars[k][1].x1 >= pt.x), end - 1)
+        if self.chars[i][0].isspace():
+            return None
+        a, b = i, i + 1
+        while a > start and not self.chars[a - 1][0].isspace():
+            a -= 1
+        while b < end and not self.chars[b][0].isspace():
+            b += 1
+        return a, b
+
+    def text(self, a, b) -> str:
+        out, prev_line = [], None
+        for c, _rect, line in self.chars[a:b]:
+            if prev_line is not None and line != prev_line:
+                out.append("\n")
+            out.append(c)
+            prev_line = line
+        return "".join(out)
+
+    def rects(self, a, b) -> list:
+        """One rectangle per line covered by the selection."""
+        out, cur, cur_line = [], None, None
+        for _c, rect, line in self.chars[a:b]:
+            if line != cur_line:
+                if cur is not None:
+                    out.append(cur)
+                lr = self.lines[line][0]
+                cur, cur_line = pymupdf.Rect(rect.x0, lr.y0, rect.x1, lr.y1), line
+            else:
+                cur.x1 = max(cur.x1, rect.x1)
+        if cur is not None:
+            out.append(cur)
+        return out
 
 
 def count_visible_chars(page: pymupdf.Page) -> int:
@@ -863,6 +947,81 @@ def signature_png_from_image(path: str) -> bytes:
     return buf.getvalue()
 
 
+IMAGE_TYPES = [("Images", "*.jpg *.jpeg *.png *.bmp *.gif *.tif *.tiff *.webp"), ("All", "*.*")]
+# label -> (longest side in pixels, JPEG quality); None keeps the image as it is.
+COMPRESSION = {
+    "None (original quality)": None,
+    "Light (2400 px, high quality)": (2400, 85),
+    "Medium (1600 px, recommended)": (1600, 72),
+    "Strong (1200 px, smallest file)": (1200, 55),
+}
+IMAGE_PAGE_SIZES = ["Same as image", "A4", "Letter"]
+
+
+def compress_image(path: str, setting) -> tuple[bytes, int, int]:
+    """Read an image file and return (data, width, height) ready for the PDF.
+
+    `setting` is (max_side, quality) to shrink and re-encode as JPEG, or None to keep
+    the original pixels (re-encoded losslessly only if the PDF can't take the file as is).
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    img = Image.open(io.BytesIO(raw))
+    fmt, original_size = img.format, img.size
+    turned = img.getexif().get(0x0112, 1) not in (1, None)  # EXIF says "rotate me"
+    if turned:
+        img = ImageOps.exif_transpose(img)
+    if setting is None:
+        if fmt in ("JPEG", "PNG") and not turned:
+            return raw, img.width, img.height
+        buf = io.BytesIO()
+        if fmt == "JPEG":
+            img.convert("RGB").save(buf, "JPEG", quality=95)
+        else:
+            if img.mode not in ("1", "L", "LA", "RGB", "RGBA", "P"):
+                img = img.convert("RGBA")
+            img.save(buf, "PNG")
+        return buf.getvalue(), img.width, img.height
+    max_side, quality = setting
+    if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        img = Image.new("RGB", rgba.size, (255, 255, 255))
+        img.paste(rgba, mask=rgba.split()[3])  # JPEG has no transparency: put it on white
+    elif img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    if max(img.size) > max_side:
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality, optimize=True)
+    data = buf.getvalue()
+    if fmt == "JPEG" and not turned and img.size == original_size and len(raw) <= len(data):
+        return raw, img.width, img.height  # already smaller than our re-encode
+    return data, img.width, img.height
+
+
+def add_image_pages(doc, images, page_size: str, start: int) -> int:
+    """Insert one page per image at index `start` (-1 = end). Returns the number of pages added.
+
+    `images` holds (data, width, height). "Same as image" makes the page the image's shape
+    (long side as long as A4); a paper size fits the image inside 0.5-inch margins.
+    """
+    a4 = pymupdf.paper_rect("a4")
+    for i, (data, w, h) in enumerate(images):
+        landscape = w > h
+        if page_size == "Same as image":
+            scale = a4.height / max(w, h)
+            pw, ph, margin = w * scale, h * scale, 0
+        else:
+            paper = pymupdf.paper_rect(page_size.lower())
+            pw, ph = sorted((paper.width, paper.height), reverse=landscape)
+            margin = 36
+        at = -1 if start < 0 else start + i
+        page = doc.new_page(pno=at, width=pw, height=ph)
+        box = pymupdf.Rect(margin, margin, pw - margin, ph - margin)
+        page.insert_image(box, stream=data, keep_proportion=True)
+    return len(images)
+
+
 def save_document(doc, path: str, password: str | None = None):
     """Save safely: write a temporary file next to the target, then swap it in."""
     folder = os.path.dirname(os.path.abspath(path)) or "."
@@ -897,9 +1056,11 @@ TOOLS = [
 DEFAULT_COLORS = {"highlight": (1.0, 0.92, 0.2), "draw": (0.1, 0.2, 0.75), "textbox": (0.0, 0.0, 0.0),
                   "note": (1.0, 0.85, 0.2)}
 PAD = 12
-PAN_HINT = "View mode: drag to move the page, scroll to change pages. Click Edit (Ctrl+E) to make changes."
+SELECTION_RGBA = (40, 110, 230, 80)  # see-through blue over selected text
+START_ZOOM = 1.5  # zoom a document opens at
+PAN_HINT = ("View mode: drag over text to select it (Ctrl+C copies), hover over a note to read it. "
+            "Click Edit (Ctrl+E) to make changes.")
 LOCKED_MENU_ITEMS = [
-    ("file", "Merge: add PDFs at the end..."), ("file", "Merge: insert PDF after this page..."),
     ("edit", "Undo"), ("edit", "Redo"), ("edit", "Find & replace text..."),
     ("edit", "Delete selected annotation"), ("edit", "Change signature..."),
     ("pages", "Rotate left"), ("pages", "Rotate right"), ("pages", "Move page up"),
@@ -1020,6 +1181,214 @@ class ChoiceDialog(Dialog):
     def ok(self):
         self.result = self.var.get()
         self.destroy()
+
+
+PAGE_SIZES = ["A4", "Letter", "Legal", "A3", "A5"]
+
+
+class NewPdfDialog(Dialog):
+    """Asks for the page size, orientation and page count of a new blank PDF."""
+
+    def __init__(self, parent):
+        super().__init__(parent, "New blank PDF")
+        ttk.Label(self.body, text="Page size:").grid(row=0, column=0, sticky="w", pady=2)
+        self.size_var = tk.StringVar(value="A4")
+        ttk.Combobox(self.body, textvariable=self.size_var, values=PAGE_SIZES, width=12,
+                     state="readonly").grid(row=0, column=1, sticky="w", padx=(8, 0), pady=2)
+        ttk.Label(self.body, text="Orientation:").grid(row=1, column=0, sticky="w", pady=2)
+        self.orient_var = tk.StringVar(value="portrait")
+        f = ttk.Frame(self.body)
+        f.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=2)
+        ttk.Radiobutton(f, text="Portrait", value="portrait", variable=self.orient_var).pack(side="left")
+        ttk.Radiobutton(f, text="Landscape", value="landscape", variable=self.orient_var).pack(
+            side="left", padx=(8, 0))
+        ttk.Label(self.body, text="Pages:").grid(row=2, column=0, sticky="w", pady=2)
+        self.count_var = tk.StringVar(value="1")
+        self.count = ttk.Spinbox(self.body, from_=1, to=500, textvariable=self.count_var, width=6)
+        self.count.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=2)
+        self.bind("<Return>", lambda e: self.ok())
+        self.buttons("Create")
+
+    def ok(self):
+        try:
+            count = max(1, min(500, int(self.count_var.get())))
+        except ValueError:
+            count = 1
+        self.result = (self.size_var.get(), self.orient_var.get() == "landscape", count)
+        self.destroy()
+
+
+class ImportImagesDialog(Dialog):
+    """Compression, page size and position for images imported as pages."""
+
+    def __init__(self, parent, count, total_bytes, has_doc, pno):
+        super().__init__(parent, "Import images")
+        ttk.Label(self.body, text="%d image%s selected (%s)." % (
+            count, "" if count == 1 else "s", format_size(total_bytes))).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(self.body, text="Compression:").grid(row=1, column=0, sticky="w", pady=2)
+        self.comp_var = tk.StringVar(value="Medium (1600 px, recommended)")
+        ttk.Combobox(self.body, textvariable=self.comp_var, values=list(COMPRESSION), width=32,
+                     state="readonly").grid(row=1, column=1, sticky="w", padx=(8, 0), pady=2)
+        ttk.Label(self.body, text="Page size:").grid(row=2, column=0, sticky="w", pady=2)
+        self.size_var = tk.StringVar(value="Same as image")
+        ttk.Combobox(self.body, textvariable=self.size_var, values=IMAGE_PAGE_SIZES, width=32,
+                     state="readonly").grid(row=2, column=1, sticky="w", padx=(8, 0), pady=2)
+        self.where_var = tk.StringVar(value="end")
+        if has_doc:
+            ttk.Label(self.body, text="Add pages:").grid(row=3, column=0, sticky="w", pady=2)
+            f = ttk.Frame(self.body)
+            f.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=2)
+            ttk.Radiobutton(f, text="At the end", value="end", variable=self.where_var).pack(side="left")
+            ttk.Radiobutton(f, text="After page %d" % (pno + 1), value="after",
+                            variable=self.where_var).pack(side="left", padx=(8, 0))
+        else:
+            ttk.Label(self.body, text="A new PDF will be created from these images.",
+                      foreground="#555").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.bind("<Return>", lambda e: self.ok())
+        self.buttons("Import")
+
+    def ok(self):
+        self.result = (COMPRESSION[self.comp_var.get()], self.size_var.get(), self.where_var.get())
+        self.destroy()
+
+
+def natural_key(path: str):
+    """Sort 'file2.pdf' before 'file10.pdf'."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", os.path.basename(path))]
+
+
+class MergeDialog(Dialog):
+    """Pick PDFs, put them in order, and choose where the merged pages go.
+
+    Result: (list of opened source documents in order, where) with where in
+    'new', 'end' or 'after'.
+    """
+
+    def __init__(self, parent, loader, has_doc, pno, initial_paths=()):
+        super().__init__(parent, "Merge PDFs")
+        self.resizable(True, True)
+        self.loader = loader  # path -> opened document, or None if cancelled / failed
+        self.items = []  # (path, doc)
+        ttk.Label(self.body, text="Files are merged from top to bottom. Drag or use the buttons to reorder."
+                  ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        lf = ttk.Frame(self.body)
+        lf.grid(row=1, column=0, sticky="nsew")
+        self.listbox = tk.Listbox(lf, width=60, height=10, activestyle="none", exportselection=False)
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.listbox.bind("<Button-1>", self._drag_start)
+        self.listbox.bind("<B1-Motion>", self._drag_move)
+        self.listbox.bind("<Delete>", lambda e: self.remove())
+        bf = ttk.Frame(self.body)
+        bf.grid(row=1, column=1, sticky="n", padx=(8, 0))
+        for text, cmd in (("Add PDFs...", self.add), ("Remove", self.remove),
+                          ("Move up", lambda: self.move(-1)), ("Move down", lambda: self.move(1))):
+            ttk.Button(bf, text=text, command=cmd, width=12).pack(fill="x", pady=(0, 4))
+        self.summary = ttk.Label(self.body, foreground="#555")
+        self.summary.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self.where_var = tk.StringVar(value="end" if has_doc else "new")
+        if has_doc:
+            f = ttk.LabelFrame(self.body, text="Put the pages", padding=(8, 4))
+            f.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            ttk.Radiobutton(f, text="At the end of the open PDF", value="end",
+                            variable=self.where_var).pack(anchor="w")
+            ttk.Radiobutton(f, text="In the open PDF, after page %d" % (pno + 1), value="after",
+                            variable=self.where_var).pack(anchor="w")
+            ttk.Radiobutton(f, text="In a new PDF (the open one is not changed)", value="new",
+                            variable=self.where_var).pack(anchor="w")
+        else:
+            ttk.Label(self.body, text="A new PDF will be created from these files.",
+                      foreground="#555").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.body.columnconfigure(0, weight=1)
+        self.body.rowconfigure(1, weight=1)
+        self.buttons("Merge")
+        self._add_paths(initial_paths)
+
+    # -- list handling
+    def _refresh(self, select=None):
+        self.listbox.delete(0, "end")
+        for path, doc in self.items:
+            n = doc.page_count
+            self.listbox.insert("end", "%s   (%d page%s)" % (os.path.basename(path), n, "" if n == 1 else "s"))
+        if select is not None and self.items:
+            select = max(0, min(len(self.items) - 1, select))
+            self.listbox.selection_set(select)
+            self.listbox.see(select)
+        pages = sum(d.page_count for _p, d in self.items)
+        self.summary.config(text="%d file%s, %d page%s in total." % (
+            len(self.items), "" if len(self.items) == 1 else "s", pages, "" if pages == 1 else "s"))
+
+    def _add_paths(self, paths):
+        for p in sorted(paths, key=natural_key):
+            doc = self.loader(p)
+            if doc is not None:
+                self.items.append((p, doc))
+        if self.winfo_viewable():
+            self.grab_set()  # a password prompt takes the grab; take it back
+        self._refresh(select=len(self.items) - 1)
+
+    def add(self):
+        paths = filedialog.askopenfilenames(parent=self, title="PDFs to merge",
+                                            filetypes=[("PDF files", "*.pdf"), ("All", "*.*")])
+        if paths:
+            self._add_paths(paths)
+
+    def _selected(self):
+        sel = self.listbox.curselection()
+        return sel[0] if sel else None
+
+    def remove(self):
+        i = self._selected()
+        if i is not None:
+            del self.items[i]
+            self._refresh(select=i)
+
+    def move(self, delta):
+        i = self._selected()
+        if i is None or not 0 <= i + delta < len(self.items):
+            return
+        self.items[i], self.items[i + delta] = self.items[i + delta], self.items[i]
+        self._refresh(select=i + delta)
+
+    def _drag_start(self, e):
+        self._drag_index = self.listbox.nearest(e.y)
+
+    def _drag_move(self, e):
+        i = self.listbox.nearest(e.y)
+        j = getattr(self, "_drag_index", None)
+        if j is None or i == j or not self.items:
+            return
+        self.items.insert(i, self.items.pop(j))
+        self._drag_index = i
+        self._refresh(select=i)
+
+    def ok(self):
+        if not self.items:
+            messagebox.showinfo(APP_NAME, "Add at least one PDF.", parent=self)
+            return
+        if self.where_var.get() == "new" and len(self.items) < 2:
+            if not messagebox.askyesno(APP_NAME, "Only one file is in the list. Make a new PDF from it anyway?",
+                                       parent=self):
+                return
+        self.result = ([d for _p, d in self.items], self.where_var.get())
+        self.destroy()
+
+
+def format_size(n: int) -> str:
+    return "%.1f MB" % (n / 1048576) if n >= 1048576 else "%d KB" % max(1, round(n / 1024))
+
+
+def blank_pdf(size: str, landscape: bool, count: int):
+    """A new document with `count` empty pages of the given paper size."""
+    rect = pymupdf.paper_rect(size.lower() + ("-l" if landscape else ""))
+    doc = pymupdf.open()
+    for _ in range(count):
+        doc.new_page(width=rect.width, height=rect.height)
+    return doc
 
 
 class ReplaceDialog(Dialog):
@@ -1150,6 +1519,7 @@ class App:
         self.password = None
         self.pno = 0
         self.zoom = 1.0
+        self.ox = PAD  # left edge of the page on the canvas; grows to centre a narrow page
         self.fit_mode = "width"
         self.dirty = False
         self.undo_stack, self.redo_stack = [], []
@@ -1165,6 +1535,8 @@ class App:
         self.drag = None
         self._img = None
         self._pg = self._pg_key = None
+        self._tip = self._tip_xref = None
+        self.sel = None  # view-mode text selection: (page number, start, end)
 
         root.title(APP_NAME)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -1176,7 +1548,6 @@ class App:
                 pass
         root.minsize(700, 450)
         root.protocol("WM_DELETE_WINDOW", self.quit)
-        self._build_menu()
         self._build_toolbar()
         self._build_body()
         self._bind_keys()
@@ -1187,23 +1558,23 @@ class App:
             root.after(50, lambda: self.open_file(path))
 
     # ---------------------------------------------------------------- layout
-    def _build_menu(self):
-        m = tk.Menu(self.root)
-        fm = tk.Menu(m, tearoff=False)
+    def _build_menu(self, parents):
+        """The File/Edit/Pages/View/Help menus, opened from the buttons at the left of the toolbar."""
+        fm = tk.Menu(parents["File"], tearoff=False)
+        fm.add_command(label="New blank PDF...", accelerator="Ctrl+N", command=self.new_blank)
         fm.add_command(label="Open...", accelerator="Ctrl+O", command=self.open_dialog)
         fm.add_command(label="Save", accelerator="Ctrl+S", command=self.save)
         fm.add_command(label="Save as...", accelerator="Ctrl+Shift+S", command=self.save_as)
         fm.add_separator()
-        fm.add_command(label="Merge: add PDFs at the end...", command=lambda: self.insert_pdfs(at_end=True))
-        fm.add_command(label="Merge: insert PDF after this page...", command=lambda: self.insert_pdfs(at_end=False))
+        fm.add_command(label="Import images as pages...", command=self.import_images)
+        fm.add_command(label="Merge PDFs...", accelerator="Ctrl+M", command=self.merge_pdfs)
         fm.add_command(label="Split: extract pages to a new PDF...", command=self.extract_pages)
         fm.add_command(label="Split: one PDF per page...", command=self.split_pages)
         fm.add_separator()
         fm.add_command(label="Close document", command=self.close_doc)
         fm.add_command(label="Exit", command=self.quit)
-        m.add_cascade(label="File", menu=fm)
 
-        em = tk.Menu(m, tearoff=False)
+        em = tk.Menu(parents["Edit"], tearoff=False)
         em.add_command(label="Switch to edit mode", accelerator="Ctrl+E", command=self.toggle_mode)
         em.add_separator()
         em.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
@@ -1212,9 +1583,8 @@ class App:
         em.add_command(label="Find & replace text...", accelerator="Ctrl+H", command=self.find_replace)
         em.add_command(label="Delete selected annotation", accelerator="Del", command=self.delete_selected)
         em.add_command(label="Change signature...", command=self.choose_signature)
-        m.add_cascade(label="Edit", menu=em)
 
-        pm = tk.Menu(m, tearoff=False)
+        pm = tk.Menu(parents["Pages"], tearoff=False)
         pm.add_command(label="Previous page", accelerator="PgUp", command=lambda: self.go(self.pno - 1))
         pm.add_command(label="Next page", accelerator="PgDn", command=lambda: self.go(self.pno + 1))
         pm.add_separator()
@@ -1223,45 +1593,75 @@ class App:
         pm.add_command(label="Move page up", command=lambda: self.move_page(-1))
         pm.add_command(label="Move page down", command=lambda: self.move_page(1))
         pm.add_command(label="Delete page", command=self.delete_page)
-        m.add_cascade(label="Pages", menu=pm)
 
-        vm = tk.Menu(m, tearoff=False)
+        vm = tk.Menu(parents["View"], tearoff=False)
         vm.add_command(label="Zoom in", accelerator="Ctrl++", command=lambda: self.set_zoom(self.zoom * 1.25))
         vm.add_command(label="Zoom out", accelerator="Ctrl+-", command=lambda: self.set_zoom(self.zoom / 1.25))
         vm.add_command(label="Fit width", command=lambda: self.fit("width"))
         vm.add_command(label="Fit page", command=lambda: self.fit("page"))
         vm.add_command(label="Actual size", command=lambda: self.set_zoom(1.0))
-        m.add_cascade(label="View", menu=vm)
 
-        hm = tk.Menu(m, tearoff=False)
+        hm = tk.Menu(parents["Help"], tearoff=False)
         hm.add_command(label="Quick guide", command=self.show_help)
         hm.add_command(label="About", command=lambda: messagebox.showinfo(
             APP_NAME, "%s %s\nA small PDF editor built with Tkinter and PyMuPDF." % (APP_NAME, APP_VERSION)))
-        m.add_cascade(label="Help", menu=hm)
-        self.root.config(menu=m)
+        for name, menu in zip(("File", "Edit", "Pages", "View", "Help"), (fm, em, pm, vm, hm)):
+            parents[name].config(menu=menu)
         self.menus = {"file": fm, "edit": em, "pages": pm}
 
     def _build_toolbar(self):
-        bar = ttk.Frame(self.root, padding=(6, 4))
+        """One compact row: menus | file buttons | Edit/Done | (edit mode) undo, tools, colour, pen."""
+        style = ttk.Style(self.root)
+        style.configure("Bar.Toolbutton", padding=(7, 3))
+        style.configure("Mode.TButton", font=("Segoe UI", 9, "bold"), padding=(10, 2))
+        self.toolbar = bar = ttk.Frame(self.root, padding=(4, 2))
         bar.pack(side="top", fill="x")
-        ttk.Button(bar, text="Open", width=6, command=self.open_dialog).pack(side="left")
-        ttk.Button(bar, text="Save", width=6, command=self.save).pack(side="left", padx=(2, 8))
-        ttk.Style(self.root).configure("Mode.TButton", font=("Segoe UI", 9, "bold"))
-        self.mode_btn = ttk.Button(bar, text="Edit", width=8, style="Mode.TButton", command=self.toggle_mode)
-        self.mode_btn.pack(side="left", padx=(0, 8))
-        self.edit_bar = ebar = ttk.Frame(bar)
-        ttk.Button(ebar, text="Undo", width=6, command=self.undo).pack(side="left")
-        ttk.Button(ebar, text="Redo", width=6, command=self.redo).pack(side="left", padx=(2, 8))
-        ttk.Separator(ebar, orient="vertical").pack(side="left", fill="y", padx=4)
-        for key, label, _hint in TOOLS:
-            ttk.Radiobutton(ebar, text=label, value=key, variable=self.tool, style="Toolbutton").pack(
-                side="left", padx=1)
-        ttk.Separator(ebar, orient="vertical").pack(side="left", fill="y", padx=6)
-        self.color_btn = tk.Button(ebar, text="  ", width=2, relief="groove", command=self.pick_color)
-        self.color_btn.pack(side="left")
-        ttk.Label(ebar, text=" Pen").pack(side="left")
-        ttk.Spinbox(ebar, from_=1, to=12, textvariable=self.pen_width, width=3).pack(side="left", padx=(2, 0))
 
+        def sep(parent):
+            ttk.Separator(parent, orient="vertical").pack(side="left", fill="y", padx=5, pady=3)
+
+        menu_buttons = {}
+        for name in ("File", "Edit", "Pages", "View", "Help"):
+            mb = ttk.Menubutton(bar, text=name, style="Bar.Toolbutton")
+            mb.pack(side="left")
+            menu_buttons[name] = mb
+            self.root.bind("<Alt-%s>" % name[0].lower(), lambda e, b=mb: self._open_menu(b))
+        self._build_menu(menu_buttons)
+        sep(bar)
+        for text, cmd in (("New", self.new_blank), ("Open", self.open_dialog), ("Save", self.save),
+                          ("Merge", self.merge_pdfs)):
+            ttk.Button(bar, text=text, style="Bar.Toolbutton", command=cmd).pack(side="left")
+        sep(bar)
+        self.mode_btn = ttk.Button(bar, text="Edit", width=7, style="Mode.TButton", command=self.toggle_mode)
+        self.mode_btn.pack(side="left", padx=2)
+
+        self.edit_bar = ebar = ttk.Frame(bar)
+        sep(ebar)
+        for text, cmd in (("Undo", self.undo), ("Redo", self.redo)):
+            ttk.Button(ebar, text=text, style="Bar.Toolbutton", command=cmd).pack(side="left")
+        sep(ebar)
+        for key, label, _hint in TOOLS:
+            ttk.Radiobutton(ebar, text=label, value=key, variable=self.tool, style="Bar.Toolbutton").pack(
+                side="left")
+        sep(ebar)
+        self.color_btn = tk.Button(ebar, text="", width=2, height=1, relief="solid", bd=1,
+                                   command=self.pick_color, cursor="hand2")
+        self.color_btn.pack(side="left", pady=4)
+        ttk.Label(ebar, text="Pen").pack(side="left", padx=(8, 3))
+        ttk.Spinbox(ebar, from_=1, to=12, textvariable=self.pen_width, width=3).pack(side="left")
+
+        # Keep the bar the same height in both modes so the page doesn't jump when switching.
+        ebar.pack(side="left")
+        bar.update_idletasks()
+        bar.configure(height=bar.winfo_reqheight())
+        bar.pack_propagate(False)
+        ebar.pack_forget()
+
+    def _open_menu(self, button):
+        """Alt+F, Alt+E... open the menus, as they did when they lived in a menu bar."""
+        menu = self.root.nametowidget(button["menu"])
+        menu.post(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        return "break"
 
     def _build_body(self):
         bottom = ttk.Frame(self.root, relief="sunken", padding=(0, 2))
@@ -1310,17 +1710,23 @@ class App:
         c.bind("<Button-4>", lambda e: self._scroll(-1, e))
         c.bind("<Button-5>", lambda e: self._scroll(1, e))
         c.bind("<Configure>", lambda e: self._resized())
+        c.bind("<Leave>", lambda e: self._hide_tip())
+        c.bind("<Button-3>", self._context_menu)
         self._show_empty()
 
     def _bind_keys(self):
         r = self.root
+        r.bind("<Control-n>", lambda e: self.new_blank())
         r.bind("<Control-o>", lambda e: self.open_dialog())
         r.bind("<Control-s>", lambda e: self.save())
         r.bind("<Control-S>", lambda e: self.save_as())
         r.bind("<Control-z>", lambda e: self.undo())
         r.bind("<Control-y>", lambda e: self.redo())
         r.bind("<Control-h>", lambda e: self.find_replace())
+        r.bind("<Control-m>", lambda e: self.merge_pdfs())
         r.bind("<Control-e>", lambda e: self.toggle_mode())
+        r.bind("<Control-c>", self._copy_key)
+        r.bind("<Control-a>", self._select_all_key)
         r.bind("<Control-plus>", lambda e: self.set_zoom(self.zoom * 1.25))
         r.bind("<Control-equal>", lambda e: self.set_zoom(self.zoom * 1.25))
         r.bind("<Control-minus>", lambda e: self.set_zoom(self.zoom / 1.25))
@@ -1342,12 +1748,12 @@ class App:
 
     def to_page(self, cx, cy) -> pymupdf.Point:
         """Canvas coordinates -> unrotated page coordinates."""
-        return pymupdf.Point((cx - PAD) / self.zoom, (cy - PAD) / self.zoom) * self.page().derotation_matrix
+        return pymupdf.Point((cx - self.ox) / self.zoom, (cy - PAD) / self.zoom) * self.page().derotation_matrix
 
     def to_canvas_rect(self, rect) -> tuple:
         r = pymupdf.Rect(rect) * self.page().rotation_matrix * pymupdf.Matrix(self.zoom, self.zoom)
         r.normalize()
-        return r.x0 + PAD, r.y0 + PAD, r.x1 + PAD, r.y1 + PAD
+        return r.x0 + self.ox, r.y0 + PAD, r.x1 + self.ox, r.y1 + PAD
 
     def canvas_xy(self, event):
         return self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
@@ -1356,8 +1762,14 @@ class App:
         self.status.config(text=text)
 
     def _update_title(self):
-        name = os.path.basename(self.path) if self.path else "No document"
+        name = os.path.basename(self.path) if self.path else ("Untitled.pdf" if self.doc else "No document")
         self.root.title("%s%s - %s" % ("*" if self.dirty else "", name, APP_NAME))
+
+    def page_text(self) -> PageText:
+        key = ("text", self.pno)
+        if key not in self.runs_cache:
+            self.runs_cache[key] = PageText(self.page())
+        return self.runs_cache[key]
 
     def runs(self):
         if self.pno not in self.runs_cache:
@@ -1372,6 +1784,7 @@ class App:
     def set_mode(self, mode):
         """'view' (read-only, the default) or 'edit' (editing tools shown)."""
         self.mode = mode
+        self.sel = None
         editing = mode == "edit"
         if editing:
             self.edit_bar.pack(side="left")
@@ -1439,21 +1852,48 @@ class App:
         if doc.page_count == 0:
             messagebox.showerror(APP_NAME, "This PDF has no pages.")
             return
+        self._set_document(doc, os.path.abspath(path), password)
+        if not any(page.get_text().strip() for page in doc.pages(0, min(doc.page_count, 5))):
+            self.set_status("This PDF looks scanned (pictures of text). Text editing needs real text.")
+
+    def _set_document(self, doc, path, password, mode="view", dirty=False):
         self._forget_page()
-        self.doc, self.path, self.password = doc, os.path.abspath(path), password
-        self.pno, self.dirty = 0, False
+        self.doc, self.path, self.password = doc, path, password
+        self.pno, self.dirty = 0, dirty
+        self.sel = None
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.resolver.reset(doc)
         self.runs_cache.clear()
         self.selected_xref = None
-        self.fit_mode = "width"
-        self.set_mode("view")
+        self.fit_mode = None
+        self.set_mode(mode)
         self._refresh_page_list()
         self._update_title()
-        self.root.after(30, lambda: self.fit("width"))
-        if not any(page.get_text().strip() for page in doc.pages(0, min(doc.page_count, 5))):
-            self.set_status("This PDF looks scanned (pictures of text). Text editing needs real text.")
+        self.root.after(30, self._initial_view)
+
+    def _initial_view(self):
+        """Open at 150%, with the page centred and its top in view."""
+        self.zoom = 0  # force a render even if the last document was also at 150%
+        self.set_zoom(START_ZOOM)
+        self.root.update_idletasks()
+        c = self.canvas
+        total = float(str(c.cget("scrollregion")).split()[2])
+        cw = c.winfo_width()
+        c.xview_moveto(max(0.0, (total - cw) / 2 / total) if total > cw else 0)
+        c.yview_moveto(0)
+
+    def new_blank(self):
+        if not self.confirm_discard():
+            return
+        r = NewPdfDialog(self.root).show()
+        if not r:
+            return
+        size, landscape, count = r
+        # A new document is unsaved, so it starts dirty and goes straight to edit mode.
+        self._set_document(blank_pdf(size, landscape, count), None, None, mode="edit", dirty=True)
+        self.set_status("New blank PDF: %d %s page%s. Use Save to choose where to keep it."
+                        % (count, size, "" if count == 1 else "s"))
 
     def close_doc(self):
         if not self.confirm_discard():
@@ -1469,7 +1909,7 @@ class App:
     def confirm_discard(self) -> bool:
         if self.doc is None or not self.dirty:
             return True
-        ans = messagebox.askyesnocancel(APP_NAME, "Save changes to '%s'?" % os.path.basename(self.path or ""))
+        ans = messagebox.askyesnocancel(APP_NAME, "Save changes to '%s'?" % os.path.basename(self.path or "Untitled.pdf"))
         if ans is None:
             return False
         if ans:
@@ -1490,10 +1930,10 @@ class App:
     def save_as(self) -> bool:
         if self.doc is None:
             return False
-        base = os.path.splitext(os.path.basename(self.path or "document.pdf"))[0]
+        base = os.path.splitext(os.path.basename(self.path))[0] + "-edited" if self.path else "Untitled"
         path = filedialog.asksaveasfilename(title="Save PDF as", defaultextension=".pdf",
                                             initialdir=os.path.dirname(self.path or ""),
-                                            initialfile=base + "-edited.pdf", filetypes=[("PDF files", "*.pdf")])
+                                            initialfile=base + ".pdf", filetypes=[("PDF files", "*.pdf")])
         if not path:
             return False
         if self._save_to(path):
@@ -1543,6 +1983,7 @@ class App:
         del self.undo_stack[:-self.MAX_HISTORY]
         self.redo_stack.clear()
         self.dirty = True
+        self.sel = None
         self.runs_cache.clear()
         self._update_title()
         self.render()
@@ -1615,8 +2056,22 @@ class App:
             self.canvas.yview_moveto(0)
 
     def _resized(self):
-        if self.doc is not None and self.fit_mode:
+        if self.doc is None:
+            return
+        if self.fit_mode:
             self.fit(self.fit_mode)
+        elif self._img is not None:
+            self._center(self._img.width(), self._img.height())
+
+    def _center(self, pw, ph):
+        """Keep the page horizontally centred when it is narrower than the window."""
+        c = self.canvas
+        cw = c.winfo_width()
+        ox = max(PAD, (cw - pw) // 2)
+        if ox != self.ox:
+            c.move("all", ox - self.ox, 0)
+            self.ox = ox
+        c.configure(scrollregion=(0, 0, max(cw, pw + 2 * PAD), ph + 2 * PAD))
 
     def fit(self, mode):
         if self.doc is None:
@@ -1641,6 +2096,7 @@ class App:
             self.render()
 
     def render(self):
+        self._hide_tip()
         if self.doc is None:
             return
         self.pno = max(0, min(self.doc.page_count - 1, self.pno))
@@ -1652,9 +2108,10 @@ class App:
             self._img = tk.PhotoImage(data=base64.b64encode(pix.tobytes("png")))
         c = self.canvas
         c.delete("all")
+        self.ox = PAD
         c.create_rectangle(PAD + 3, PAD + 3, PAD + pix.width + 3, PAD + pix.height + 3, fill="#3c3f44", width=0)
         c.create_image(PAD, PAD, anchor="nw", image=self._img, tags="page")
-        c.configure(scrollregion=(0, 0, pix.width + 2 * PAD, pix.height + 2 * PAD))
+        self._center(pix.width, pix.height)
         self.zoom_label.config(text="%d%%" % round(self.zoom * 100))
         self.page_var.set(str(self.pno + 1))
         self.page_total.config(text="/ %d" % self.doc.page_count)
@@ -1667,6 +2124,16 @@ class App:
         c = self.canvas
         c.delete("overlay")
         page = self.page()
+        self._sel_imgs = []
+        if self.sel and self.sel[0] == self.pno:
+            # Tk can't fill shapes with see-through colour, so each selected line gets a
+            # translucent image instead.
+            for r in self.page_text().rects(self.sel[1], self.sel[2]):
+                x0, y0, x1, y1 = (int(round(v)) for v in self.to_canvas_rect(r))
+                img = ImageTk.PhotoImage(Image.new("RGBA", (max(1, x1 - x0), max(1, y1 - y0)), SELECTION_RGBA),
+                                         master=c)
+                self._sel_imgs.append(img)
+                c.create_image(x0, y0, anchor="nw", image=img, tags="overlay")
         if self.tool.get() == "forms":
             for w in page.widgets():
                 c.create_rectangle(*self.to_canvas_rect(w.rect), outline="#1e6fd9", dash=(3, 2), tags="overlay")
@@ -1681,7 +2148,7 @@ class App:
         tool = self.tool.get()
         hint = dict((k, h) for k, _l, h in TOOLS).get(tool, PAN_HINT)
         self.set_status(hint)
-        cursors = {"pan": "fleur", "select": "arrow", "edittext": "xterm", "highlight": "xterm", "draw": "pencil",
+        cursors = {"pan": "arrow", "select": "arrow", "edittext": "xterm", "highlight": "xterm", "draw": "pencil",
                    "textbox": "crosshair", "note": "crosshair", "sign": "crosshair", "forms": "hand2"}
         self.canvas.config(cursor=cursors.get(tool, "arrow"))
         color = self.colors.get(tool)
@@ -1691,6 +2158,7 @@ class App:
         if tool != "select":
             self.selected_xref = None
         self.canvas.delete("hover")
+        self._hide_tip()
         if self.doc is not None:
             self._draw_overlays()
         if tool == "sign" and self.doc is not None and self.signature_png is None:
@@ -1733,6 +2201,109 @@ class App:
             w = self._widget_at(pt)
             if w is not None:
                 c.create_rectangle(*self.to_canvas_rect(w.rect), outline="#1e6fd9", width=2, tags="hover")
+        elif tool == "pan":
+            self._note_tip(pt, e)
+            over_text = self._tip is None and self.page_text().line_at(pt) is not None
+            c.config(cursor="xterm" if over_text else "arrow")
+
+    # ---------------------------------------------------------------- note tooltips (view mode)
+    def _note_tip(self, pt, e):
+        """Show a note's text in a tooltip while the mouse is over it."""
+        a = self._annot_at(pt)
+        info = a.info if a is not None else {}
+        text = (info.get("content") or "").strip()
+        if not text:
+            self._hide_tip()
+            return
+        if self._tip is None or self._tip_xref != a.xref:
+            self._hide_tip()
+            self._tip_xref = a.xref
+            self._tip = tip = tk.Toplevel(self.root)
+            tip.wm_overrideredirect(True)
+            tip.attributes("-topmost", True)
+            box = tk.Frame(tip, bg="#fff8c4", bd=1, relief="solid", padx=8, pady=5)
+            box.pack()
+            author = (info.get("title") or "").strip()
+            if author:
+                tk.Label(box, text=author, bg="#fff8c4", font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
+            tk.Label(box, text=text, bg="#fff8c4", font=("Segoe UI", 9), justify="left",
+                     wraplength=360, anchor="w").pack(fill="x")
+        # Next to the pointer, but kept on screen.
+        tip = self._tip
+        tip.update_idletasks()
+        x, y = e.x_root + 14, e.y_root + 18
+        if x + tip.winfo_reqwidth() > tip.winfo_screenwidth():
+            x = e.x_root - tip.winfo_reqwidth() - 6
+        if y + tip.winfo_reqheight() > tip.winfo_screenheight():
+            y = e.y_root - tip.winfo_reqheight() - 6
+        tip.geometry("+%d+%d" % (x, y))
+
+    def _hide_tip(self):
+        if self._tip is not None:
+            self._tip.destroy()
+        self._tip, self._tip_xref = None, None
+
+    # ---------------------------------------------------------------- text selection (view mode)
+    def _set_selection(self, sel):
+        if sel == self.sel:
+            return
+        self.sel = sel
+        self._draw_overlays()
+        if sel:
+            n = sel[2] - sel[1]
+            self.set_status("%d character%s selected. Ctrl+C to copy, or right-click." % (n, "" if n == 1 else "s"))
+        else:
+            self.set_status(PAN_HINT)
+
+    def selected_text(self) -> str:
+        if not self.sel or self.doc is None or self.sel[0] != self.pno:
+            return ""
+        return self.page_text().text(self.sel[1], self.sel[2])
+
+    def copy_selection(self):
+        text = self.selected_text()
+        if not text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.set_status("Copied %d character%s." % (len(text), "" if len(text) == 1 else "s"))
+
+    def select_all(self):
+        if self.doc is None or self.mode != "view":
+            return
+        n = len(self.page_text().chars)
+        self._set_selection((self.pno, 0, n) if n else None)
+        if not n:
+            self.set_status("This page has no selectable text (it may be a scanned image).")
+
+    def _copy_key(self, e):
+        if isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text)):
+            return None  # let text boxes copy their own text
+        self.copy_selection()
+        return "break"
+
+    def _select_all_key(self, e):
+        if isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text)):
+            return None
+        self.select_all()
+        return "break"
+
+    def _context_menu(self, e):
+        if self.doc is None or self.mode != "view":
+            return
+        m = tk.Menu(self.root, tearoff=False)
+        m.add_command(label="Copy", accelerator="Ctrl+C", command=self.copy_selection,
+                      state="normal" if self.selected_text() else "disabled")
+        m.add_command(label="Select all on this page", accelerator="Ctrl+A", command=self.select_all)
+        m.tk_popup(e.x_root, e.y_root)
+
+    def _autoscroll(self, e):
+        """Scroll when a selection is dragged past the top or bottom edge."""
+        c = self.canvas
+        if e.y < 0:
+            c.yview_scroll(-1, "units")
+        elif e.y > c.winfo_height():
+            c.yview_scroll(1, "units")
 
     def _press(self, e):
         if self.doc is None:
@@ -1741,8 +2312,11 @@ class App:
         x, y = self.canvas_xy(e)
         tool = self.tool.get()
         self.drag = {"start": (x, y), "last": (x, y), "points": [(x, y)], "tool": tool}
+        self._hide_tip()
         if tool == "pan":
-            self.canvas.scan_mark(int(e.x), int(e.y))
+            self.drag["caret"] = self.page_text().caret(self.to_page(x, y))
+            if self.sel:
+                self._set_selection(None)
         if tool == "select":
             a = self._annot_at(self.to_page(x, y))
             self.selected_xref = a.xref if a is not None else None
@@ -1757,7 +2331,10 @@ class App:
         c = self.canvas
         tool = d["tool"]
         if tool == "pan":
-            c.scan_dragto(int(e.x), int(e.y), gain=1)
+            a, b = d.get("caret"), self.page_text().caret(self.to_page(x, y))
+            if a is not None and b is not None:
+                self._set_selection((self.pno, min(a, b), max(a, b)) if a != b else None)
+            self._autoscroll(e)
         elif tool == "draw":
             lx, ly = d["last"]
             w = max(1, self.pen_width.get() * self.zoom)
@@ -1808,6 +2385,11 @@ class App:
             self.move_annot(d["annot"], self.to_page(sx, sy), self.to_page(x, y))
 
     def _double(self, e):
+        if self.doc is not None and self.tool.get() == "pan":
+            x, y = self.canvas_xy(e)
+            w = self.page_text().word(self.to_page(x, y))
+            self._set_selection((self.pno, w[0], w[1]) if w else None)
+            return
         if self.doc is None or self.tool.get() != "select":
             return
         x, y = self.canvas_xy(e)
@@ -1818,10 +2400,13 @@ class App:
     def _wheel(self, e):
         if e.state & 0x0004:  # Ctrl held: zoom
             self.set_zoom(self.zoom * (1.1 if e.delta > 0 else 1 / 1.1))
+        elif e.state & 0x0001:  # Shift held: sideways
+            self.canvas.xview_scroll(-3 if e.delta > 0 else 3, "units")
         else:
             self._scroll(-1 if e.delta > 0 else 1, e)
 
     def _scroll(self, direction, e):
+        self._hide_tip()
         c = self.canvas
         top, bottom = c.yview()
         if direction > 0 and bottom >= 0.999 and self.doc is not None and self.pno < self.doc.page_count - 1:
@@ -2115,45 +2700,113 @@ class App:
         self.modify("Delete page", lambda: self.doc.delete_page(self.pno))
         self._refresh_page_list()
 
-    def insert_pdfs(self, at_end=True):
-        if self.doc is None:
-            messagebox.showinfo(APP_NAME, "Open a PDF first.")
-            return
-        if not self._require_edit():
-            return
-        if at_end:
-            paths = filedialog.askopenfilenames(title="PDFs to add at the end",
-                                                filetypes=[("PDF files", "*.pdf")])
-        else:
-            p = filedialog.askopenfilename(title="PDF to insert after page %d" % (self.pno + 1),
-                                           filetypes=[("PDF files", "*.pdf")])
-            paths = [p] if p else []
+    def _load_merge_source(self, path):
+        """Open a PDF for merging; reports problems and returns None if it can't be used."""
+        name = os.path.basename(path)
+        try:
+            src, _pw = self._load_pdf(path)
+        except Exception as ex:
+            messagebox.showerror(APP_NAME, "Could not open %s:\n%s" % (name, ex))
+            return None
+        if src is not None and src.page_count == 0:
+            messagebox.showerror(APP_NAME, "%s has no pages." % name)
+            return None
+        return src
+
+    def merge_pdfs(self):
+        """Combine several PDFs, in an order the user picks, into the open PDF or a new one."""
+        has_doc = self.doc is not None
+        paths = filedialog.askopenfilenames(title="PDFs to merge",
+                                            filetypes=[("PDF files", "*.pdf"), ("All", "*.*")])
         if not paths:
             return
-        sources = []
-        for p in paths:
+        r = MergeDialog(self.root, self._load_merge_source, has_doc, self.pno, paths).show()
+        if not r:
+            return
+        sources, where = r
+        total = sum(s.page_count for s in sources)
+        files = "%d file%s" % (len(sources), "" if len(sources) == 1 else "s")
+        pages = "%d page%s" % (total, "" if total == 1 else "s")
+
+        if where == "new":
+            if not self.confirm_discard():
+                return
+            doc = pymupdf.open()
+            self.busy()
             try:
-                src, _pw = self._load_pdf(p)
+                for src in sources:
+                    doc.insert_pdf(src)
             except Exception as ex:
-                messagebox.showerror(APP_NAME, "Could not open %s:\n%s" % (os.path.basename(p), ex))
+                messagebox.showerror(APP_NAME, "Merge failed:\n%s" % ex)
                 return
-            if src is None:
-                return
-            sources.append(src)
+            finally:
+                self.busy(False)
+            self._set_document(doc, None, None, mode="edit", dirty=True)
+            self.set_status("Merged %s into a new PDF with %s. Use Save to keep it." % (files, pages))
+            return
+
+        if self.mode != "edit":
+            self.set_mode("edit")  # merging is an edit; don't make the user switch first
+        start = -1 if where == "end" else self.pno + 1
 
         def do():
-            start = -1 if at_end else self.pno + 1
-            added = 0
+            at = self.doc.page_count if start < 0 else start
+            first = at
             for src in sources:
-                self.doc.insert_pdf(src, start_at=start if start < 0 else start + added)
-                added += src.page_count
-            return added
+                self.doc.insert_pdf(src, start_at=at)
+                at += src.page_count
+            return first
 
-        added = self.modify("Merge PDFs", do)
-        if added:
+        first = self.modify("Merge PDFs", do)
+        if first is not None:
             self.resolver.reset(self.doc)
             self._refresh_page_list()
-            self.set_status("Added %d page(s)." % added)
+            self.go(first)
+            self.set_status("Added %s from %s (Ctrl+Z to undo)." % (pages, files))
+
+    def import_images(self):
+        """Add images as pages (shrunk and re-compressed if asked), or make a new PDF from them."""
+        paths = filedialog.askopenfilenames(title="Images to import", filetypes=IMAGE_TYPES)
+        if not paths:
+            return
+        has_doc = self.doc is not None
+        total = sum(os.path.getsize(p) for p in paths)
+        r = ImportImagesDialog(self.root, len(paths), total, has_doc, self.pno).show()
+        if not r:
+            return
+        setting, page_size, where = r
+        images = []
+        self.busy()
+        try:
+            for i, p in enumerate(paths):
+                self.set_status("Compressing image %d of %d..." % (i + 1, len(paths)))
+                self.root.update_idletasks()
+                try:
+                    images.append(compress_image(p, setting))
+                except Exception as ex:
+                    messagebox.showerror(APP_NAME, "Could not read %s:\n%s" % (os.path.basename(p), ex))
+                    self.set_status("Import cancelled.")
+                    return
+        finally:
+            self.busy(False)
+        after = sum(len(d) for d, _w, _h in images)
+        summary = "Images: %s → %s." % (format_size(total), format_size(after))
+
+        if not has_doc:
+            doc = pymupdf.open()
+            add_image_pages(doc, images, page_size, -1)
+            self._set_document(doc, None, None, mode="edit", dirty=True)
+            self.set_status("New PDF with %d page%s. %s Use Save to keep it."
+                            % (len(images), "" if len(images) == 1 else "s", summary))
+            return
+        if self.mode != "edit":
+            self.set_mode("edit")  # importing is an edit; don't make the user switch first
+        start = -1 if where == "end" else self.pno + 1
+        added = self.modify("Import images", lambda: add_image_pages(self.doc, images, page_size, start))
+        if added:
+            self._refresh_page_list()
+            self.go(self.doc.page_count - added if start < 0 else start)
+            self.set_status("Added %d page%s. %s" % (added, "" if added == 1 else "s", summary))
 
     def extract_pages(self):
         if self.doc is None:
@@ -2216,7 +2869,9 @@ class App:
     # ---------------------------------------------------------------- help
     def show_help(self):
         messagebox.showinfo(APP_NAME, (
-            "PDFs open in view mode. Click Edit (Ctrl+E) to make changes, and Done to go back.\n\n"
+            "PDFs open in view mode. Drag over text to select it, double-click a word, Ctrl+A selects\n"
+            "the whole page, Ctrl+C copies. Hover over a note to read it.\n"
+            "Click Edit (Ctrl+E) to make changes, and Done to go back.\n\n"
             "Edit text: choose 'Edit text', hover over a line, click, type the new text.\n"
             "Find & replace: Edit > Find & replace (Ctrl+H).\n"
             "Highlight: drag across words.   Draw: drag freehand.\n"
@@ -2224,7 +2879,8 @@ class App:
             "Sign: draw or load your signature once, then drag a box on the page.\n"
             "Fill forms: click a field outlined in blue.\n"
             "Select: click an annotation, drag to move, Del to delete, double-click to edit.\n"
-            "Pages menu: rotate, move, delete.  File menu: merge and split.\n"
+            "Pages menu: rotate, move, delete.  File menu: new blank PDF (Ctrl+N), import images, split.\n"
+            "Merge (Ctrl+M): pick PDFs, put them in order, add them to this PDF or make a new one.\n"
             "Ctrl+Z undoes any change. Nothing is written to disk until you Save."))
 
 

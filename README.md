@@ -4,13 +4,15 @@ A small, free desktop PDF editor for Windows, written in Python with Tkinter and
 
 ## Features
 
-- **View mode by default**: PDFs open read-only. Click **Edit** (Ctrl+E) to show the editing tools, and **Done** to go back
+- **View mode by default**: PDFs open read-only at 150%. Drag over text to select it, double-click a word, Ctrl+A for the whole page, and Ctrl+C (or right-click) to copy. Hover over a note to read it. Click **Edit** (Ctrl+E) to show the editing tools, and **Done** to go back
+- **New blank PDF** (Ctrl+N): choose the page size (A4, Letter, Legal, A3, A5), orientation and number of pages, then add text boxes, drawings, signatures and more
+- **Import images as pages** (JPG, PNG, WebP, GIF, BMP, TIFF): compress them (None, Light, Medium or Strong), pick the page size (same as the image, A4 or Letter), and add them to the open PDF or make a new PDF from them. Phone photos are turned the right way up
 - **Edit existing text**: hover over a line, click it, and type. Only the part you changed is rewritten.
 - **Find & replace** across the whole document (Ctrl+H)
 - **Highlight**, **freehand drawing**, **text boxes** and **sticky notes**
 - **Sign**: draw your signature or load an image of it, then place it on the page (it can be remembered for next time)
 - **Fill in forms**: text fields, checkboxes, radio buttons and drop-down lists
-- **Merge**: add PDFs at the end, or insert one after the current page
+- **Merge PDFs** (Ctrl+M, or the **Merge** button): pick several PDFs, put them in order (drag or Move up/down), then add them at the end of the open PDF, after the current page, or combine them into a new PDF. Works without a PDF open too
 - **Split**: extract chosen pages (e.g. `1-3, 5`) or save one PDF per page
 - **Pages**: rotate, move up/down, delete
 - **Undo / redo** for every change; nothing is written to disk until you save
